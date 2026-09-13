@@ -1,9 +1,8 @@
-import asyncio
 import logging
 from decimal import Decimal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -52,6 +51,7 @@ router = APIRouter(prefix="/bookings")
 )
 def create_booking(
     booking_data: BookingCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_client),
 ):
@@ -142,16 +142,16 @@ def create_booking(
 
     # Dispatch smart pitches to matched artisans (async operation)
     try:
-        # Run async dispatch in background (fire and forget)
-        asyncio.create_task(
-            notification_service.dispatch_to_matched_artisans(db, new_booking)
+        # Run async dispatch after the response is sent (fire and forget)
+        background_tasks.add_task(
+            notification_service.dispatch_to_matched_artisans, db, new_booking
         )
     except ImportError:
         # Notification service not available, continue without dispatch
         pass
     except Exception as e:
         # Log error but don't fail booking creations
-        print(f"Failed to dispatch notifications: {e}")
+        logger.warning(f"Failed to dispatch notifications: {e}")
 
     return new_booking
 
@@ -211,6 +211,7 @@ def get_all_bookings(
 def update_booking_status(
     booking_id: UUID,
     status_payload: BookingStatusUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
@@ -290,12 +291,11 @@ def update_booking_status(
 
         if status_payload.required_materials and not booking.client_supplies_override:
             # Trigger inventory check in background
-            asyncio.create_task(
-                inventory_service.check_route_inventory(
-                    artisan=user_artisan,
-                    booking=booking,
-                    required_materials=status_payload.required_materials,
-                )
+            background_tasks.add_task(
+                inventory_service.check_route_inventory,
+                artisan=user_artisan,
+                booking=booking,
+                required_materials=status_payload.required_materials,
             )
 
     # CONFIRMED -> IN_PROGRESS: Only artisan can perform this transition
@@ -363,15 +363,14 @@ def update_booking_status(
             and booking.client
             and booking.client.user_id
         ):
-            asyncio.create_task(
-                notification_service.create_notification(
-                    db=db,
-                    user_id=booking.client.user_id,
-                    type="booking_confirmed",
-                    title="Booking Confirmed",
-                    message=f"Your booking for '{booking.service}' has been accepted.",
-                    reference_id=str(booking.id),
-                )
+            background_tasks.add_task(
+                notification_service.create_notification,
+                db=db,
+                user_id=booking.client.user_id,
+                type="booking_confirmed",
+                title="Booking Confirmed",
+                message=f"Your booking for '{booking.service}' has been accepted.",
+                reference_id=str(booking.id),
             )
         elif new_status == BookingStatus.CANCELLED:
             # Notify client if artisan cancelled, or notify artisan if client cancelled
@@ -382,15 +381,14 @@ def update_booking_status(
                 recipient_user_id = booking.artisan.user_id
 
             if recipient_user_id:
-                asyncio.create_task(
-                    notification_service.create_notification(
-                        db=db,
-                        user_id=recipient_user_id,
-                        type="booking_cancelled",
-                        title="Booking Cancelled",
-                        message=f"Booking for '{booking.service}' has been cancelled.",
-                        reference_id=str(booking.id),
-                    )
+                background_tasks.add_task(
+                    notification_service.create_notification,
+                    db=db,
+                    user_id=recipient_user_id,
+                    type="booking_cancelled",
+                    title="Booking Cancelled",
+                    message=f"Booking for '{booking.service}' has been cancelled.",
+                    reference_id=str(booking.id),
                 )
     except Exception as e:
         logger.warning(f"Failed to send booking status notification: {e}")
@@ -407,6 +405,7 @@ def update_booking_status(
 def submit_bid(
     booking_id: UUID,
     bid_data: BidCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_client_or_artisan),
 ):
@@ -457,15 +456,14 @@ def submit_bid(
     # Trigger real-time notification to client
     try:
         if booking.client and booking.client.user_id:
-            asyncio.create_task(
-                notification_service.create_notification(
-                    db=db,
-                    user_id=booking.client.user_id,
-                    type="bid_received",
-                    title="New Pitch Received",
-                    message=f"Artisan submitted a pitch/bid for '{booking.service}'.",
-                    reference_id=str(booking.id),
-                )
+            background_tasks.add_task(
+                notification_service.create_notification,
+                db=db,
+                user_id=booking.client.user_id,
+                type="bid_received",
+                title="New Pitch Received",
+                message=f"Artisan submitted a pitch/bid for '{booking.service}'.",
+                reference_id=str(booking.id),
             )
     except Exception as e:
         logger.warning(f"Failed to send bid notification: {e}")

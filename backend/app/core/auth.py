@@ -99,7 +99,8 @@ def require_roles(allowed_roles: list[RoleEnum]):
         if user_role not in allowed_role_values:
             role_names = ", ".join(allowed_role_values)
             raise AuthorizationError(
-                f"Access denied. Required roles: {role_names}. Your role: {user_role}"
+                f"Insufficient permissions. Access denied. Required roles: {role_names}. "
+                f"Your role: {user_role}"
             )
 
         return current_user

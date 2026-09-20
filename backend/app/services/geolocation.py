@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import math
 from decimal import Decimal
 from urllib.parse import quote
@@ -10,12 +9,15 @@ import aiohttp
 from app.core.cache import cache
 from app.schemas.artisan import GeolocationResponse
 
+LOCATION_TTL_SECONDS = 900  # 15 minutes
+
 
 class GeolocationService:
     """Service for handling geolocation operations and Redis geospatial indexing"""
 
     def __init__(self):
-        self.redis_key = "artisan_locations"
+        self.redis_key = "artisans:locations"
+        self._ttl_key = "artisan:location:ttl"
 
     async def geocode_address(self, address: str) -> GeolocationResponse | None:
         """
@@ -65,25 +67,26 @@ class GeolocationService:
             return None
 
     async def add_artisan_location(
-        self, artisan_id: int, latitude: Decimal, longitude: Decimal
+        self, artisan_id: int, latitude: float | Decimal, longitude: float | Decimal
     ) -> bool:
-        """Add or update artisan location in Redis geospatial index"""
+        """Add or update artisan location in Redis geospatial index with TTL.
+
+        The location will expire after LOCATION_TTL_SECONDS (15 minutes) of inactivity.
+        """
         try:
             if not cache.redis:
                 return False
 
+            member_id = str(artisan_id)
+
             # Add to Redis geospatial index
             await cache.redis.geoadd(
-                self.redis_key, float(longitude), float(latitude), str(artisan_id)
+                self.redis_key, float(longitude), float(latitude), member_id
             )
 
-            # Store additional artisan data
-            artisan_data = {
-                "latitude": str(latitude),
-                "longitude": str(longitude),
-                "updated_at": str(asyncio.get_event_loop().time()),
-            }
-            await cache.redis.hset(f"artisan_geo:{artisan_id}", mapping=artisan_data)
+            # Set TTL for this artisan - individual key for expiry tracking
+            ttl_key = f"artisan:location:ttl:{artisan_id}"
+            await cache.redis.set(ttl_key, "1", ex=LOCATION_TTL_SECONDS)
 
             return True
         except Exception as e:
@@ -91,21 +94,52 @@ class GeolocationService:
             return False
 
     async def remove_artisan_location(self, artisan_id: int) -> bool:
-        """Remove artisan from geospatial index"""
+        """Remove artisan from geospatial index and clean up TTL key"""
         try:
             if not cache.redis:
                 return False
 
-            # Remove from geospatial index
-            await cache.redis.zrem(self.redis_key, str(artisan_id))
+            member_id = str(artisan_id)
 
-            # Remove additional data
-            await cache.redis.delete(f"artisan_geo:{artisan_id}")
+            # Remove from geospatial index
+            await cache.redis.zrem(self.redis_key, member_id)
+
+            # Remove TTL key
+            await cache.redis.delete(f"artisan:location:ttl:{artisan_id}")
 
             return True
         except Exception as e:
             print(f"Error removing artisan location from Redis: {e}")
             return False
+
+    async def cleanup_expired_locations(self) -> int:
+        """Remove expired artisan locations from the geospatial index.
+
+        This should be called periodically to clean up artisans whose TTL has expired.
+        Returns the number of removed entries.
+        """
+        try:
+            if not cache.redis:
+                return 0
+
+            # Find all members in the geospatial index
+            members = await cache.redis.zrange(self.redis_key, 0, -1)
+            removed_count = 0
+
+            for member in members:
+                artisan_id = int(member)
+                ttl_key = f"artisan:location:ttl:{artisan_id}"
+
+                # Check if TTL key exists (not expired)
+                exists = await cache.redis.exists(ttl_key)
+                if not exists:
+                    await cache.redis.zrem(self.redis_key, member)
+                    removed_count += 1
+
+            return removed_count
+        except Exception as e:
+            print(f"Error cleaning up expired locations: {e}")
+            return 0
 
     async def find_nearby_artisans(
         self,
@@ -215,7 +249,7 @@ class GeolocationService:
             return {}
 
     async def bulk_update_locations(self, artisan_locations: list[dict]) -> int:
-        """Bulk update multiple artisan locations"""
+        """Bulk update multiple artisan locations with TTL"""
         try:
             if not cache.redis or not artisan_locations:
                 return 0
@@ -234,6 +268,12 @@ class GeolocationService:
             # Bulk add to geospatial index
             if geo_data:
                 await cache.redis.geoadd(self.redis_key, *geo_data)
+
+                # Set TTL for each artisan
+                for location in artisan_locations:
+                    ttl_key = f"artisan:location:ttl:{location['artisan_id']}"
+                    await cache.redis.set(ttl_key, "1", ex=LOCATION_TTL_SECONDS)
+
                 return len(artisan_locations)
 
             return 0

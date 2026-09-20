@@ -60,6 +60,18 @@ class ArtisanLocationUpdate(BaseModel):
         return v
 
 
+class FastLocationUpdate(BaseModel):
+    latitude: float = Field(..., ge=-90, le=90, description="Latitude coordinate")
+    longitude: float = Field(..., ge=-180, le=180, description="Longitude coordinate")
+
+
+class FastLocationResponse(BaseModel):
+    artisan_id: int
+    latitude: float
+    longitude: float
+    ttl_seconds: int = 900
+
+
 class PortfolioCreate(BaseModel):
     title: str = Field(..., max_length=200)
     description: str | None = None
@@ -144,9 +156,9 @@ class ArtisanOut(BaseModel):
     @classmethod
     def parse_specialties(cls, v):
         if isinstance(v, str):
-            import json
-
             try:
+                import json
+
                 return json.loads(v)
             except json.JSONDecodeError:
                 return []

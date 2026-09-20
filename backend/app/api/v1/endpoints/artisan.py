@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
+import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
@@ -13,10 +15,9 @@ from app.core.auth import (
     require_admin,
     require_artisan,
 )
-
-# Import correct dependencies
-from app.db.session import get_db  # Or use app.db.database depending on your setup
+from app.db.session import get_db
 from app.models.artisan import Artisan
+from app.models.booking import Booking
 from app.models.portfolio import Portfolio
 from app.models.user import User
 from app.schemas.artisan import (
@@ -26,6 +27,8 @@ from app.schemas.artisan import (
     ArtisanProfileCreate,
     ArtisanProfileResponse,
     ArtisanProfileUpdate,
+    FastLocationResponse,
+    FastLocationUpdate,
     GeolocationRequest,
     GeolocationResponse,
     NearbyArtisansRequest,
@@ -35,7 +38,7 @@ from app.schemas.artisan import (
 )
 from app.services.artisan import ArtisanService
 from app.services.artisan_service import find_nearby_artisans_cached
-from app.services.geolocation import geolocation_service
+from app.services.geolocation import LOCATION_TTL_SECONDS, geolocation_service
 
 router = APIRouter(prefix="/artisans")
 
@@ -233,13 +236,57 @@ async def update_artisan_profile(
     return updated_artisan
 
 
-@router.put("/location", response_model=ArtisanOut)
+@router.put("/location", response_model=FastLocationResponse)
 async def update_artisan_location(
+    location_data: FastLocationUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_artisan),
+):
+    """Fast location update - stores coordinates in Redis only (no PostgreSQL writes).
+
+    Use this endpoint for high-frequency location updates from artisan mobile devices.
+    Location expires after 15 minutes of inactivity.
+    """
+    service = ArtisanService(db)
+    artisan = service.get_artisan_by_user_id(current_user.id)
+
+    if not artisan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Artisan profile not found"
+        )
+
+    # Add location to Redis geospatial index with TTL
+    success = await geolocation_service.add_artisan_location(
+        artisan.id,
+        location_data.latitude,
+        location_data.longitude,
+    )
+
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update location in Redis",
+        )
+
+    return FastLocationResponse(
+        artisan_id=artisan.id,
+        latitude=location_data.latitude,
+        longitude=location_data.longitude,
+        ttl_seconds=LOCATION_TTL_SECONDS,
+    )
+
+
+@router.put("/location/full", response_model=ArtisanOut)
+async def update_artisan_location_full(
     location_data: ArtisanLocationUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_artisan),
 ):
-    """Update artisan location with optional geocoding - artisan only"""
+    """Update artisan location with optional geocoding - artisan only.
+
+    This endpoint updates both Redis and PostgreSQL. For high-frequency updates,
+    use PUT /location instead.
+    """
     service = ArtisanService(db)
     artisan = service.get_artisan_by_user_id(current_user.id)
     if not artisan:
@@ -384,9 +431,6 @@ def upload_portfolio_image(
     The file is stored locally under /tmp/stellarts_uploads and the generated
     URL is returned.  In production this would be replaced by an S3/CDN upload.
     """
-    import os
-    import uuid
-
     service = ArtisanService(db)
     artisan = service.get_artisan_by_user_id(current_user.id)
     if not artisan:
@@ -489,8 +533,6 @@ def get_artisan_bookings(
     if not artisan:
         raise HTTPException(status_code=404, detail="Artisan profile not found")
 
-    from app.models.booking import Booking
-
     bookings = db.query(Booking).filter(Booking.artisan_id == artisan.id).all()
 
     return {
@@ -554,8 +596,6 @@ def get_artisan_profile(artisan_id: int, db: Session = Depends(get_db)):
     specialty_str = None
     if artisan.specialties:
         try:
-            import json
-
             specs = json.loads(artisan.specialties)
             if isinstance(specs, list):
                 # Take the first one as primary or join them

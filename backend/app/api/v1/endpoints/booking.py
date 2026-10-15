@@ -1,4 +1,5 @@
 import logging
+from datetime import UTC, timedelta
 from decimal import Decimal
 from uuid import UUID
 
@@ -17,6 +18,7 @@ from app.core.config import settings
 from app.db.session import get_db
 from app.models.artisan import Artisan
 from app.models.booking import Booking, BookingStatus
+from app.models.calendar import ArtisanCalendarEvent
 from app.models.client import Client
 from app.models.review import Review
 from app.models.user import User
@@ -108,6 +110,49 @@ def create_booking(
     bid_data = ai_service.calculate_bid_range(
         booking_data.service, hourly_rate, estimated_hours
     )
+
+    requested_start = booking_data.date.replace(tzinfo=UTC)
+    requested_end = requested_start + timedelta(hours=float(estimated_hours))
+    active_statuses = [
+        BookingStatus.PENDING,
+        BookingStatus.CONFIRMED,
+        BookingStatus.IN_PROGRESS,
+        BookingStatus.COMPLETED,
+    ]
+    existing_bookings = (
+        db.query(Booking)
+        .filter(
+            Booking.artisan_id == booking_data.artisan_id,
+            Booking.status.in_(active_statuses),
+        )
+        .all()
+    )
+    for existing in existing_bookings:
+        if not existing.date:
+            continue
+        existing_start = existing.date.replace(tzinfo=UTC)
+        existing_hours = float(existing.estimated_hours or 2.0)
+        existing_end = existing_start + timedelta(hours=existing_hours)
+        if max(requested_start, existing_start) < min(requested_end, existing_end):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Requested slot conflicts with an existing artisan booking",
+            )
+
+    calendar_conflict = (
+        db.query(ArtisanCalendarEvent)
+        .filter(
+            ArtisanCalendarEvent.artisan_id == booking_data.artisan_id,
+            ArtisanCalendarEvent.start_time < requested_end,
+            ArtisanCalendarEvent.end_time > requested_start,
+        )
+        .first()
+    )
+    if calendar_conflict:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Requested slot conflicts with the artisan calendar",
+        )
 
     pitch = ai_service.generate_smart_pitch(
         booking_data.service,

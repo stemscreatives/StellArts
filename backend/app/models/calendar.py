@@ -19,6 +19,13 @@ class ArtisanCalendarConfig(Base):
     google_refresh_token = Column(
         String(1024), nullable=True
     )  # Symmetrically encrypted
+    outlook_access_token = Column(
+        String(1024), nullable=True
+    )  # Symmetrically encrypted
+    outlook_refresh_token = Column(
+        String(1024), nullable=True
+    )  # Symmetrically encrypted
+    provider = Column(String(50), default="google", nullable=False)
     token_expiry = Column(DateTime(timezone=True), nullable=True)
     calendar_id = Column(String(255), default="primary", nullable=False)
     last_synced_at = Column(DateTime(timezone=True), nullable=True)

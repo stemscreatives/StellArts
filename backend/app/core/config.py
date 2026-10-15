@@ -61,6 +61,9 @@ class Settings(BaseSettings):
     # Google Calendar OAuth
     GOOGLE_CLIENT_ID: str | None = None
     GOOGLE_CLIENT_SECRET: str | None = None
+    OUTLOOK_CLIENT_ID: str | None = None
+    OUTLOOK_CLIENT_SECRET: str | None = None
+    OUTLOOK_TENANT_ID: str = "common"
 
     # Routing Configuration
     ROUTING_PROVIDER: str = "osrm"

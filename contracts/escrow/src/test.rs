@@ -3291,3 +3291,241 @@ mod dao_dispute_tests {
         assert_eq!(client.get_engagement(&id).status, Status::Released);
     }
 }
+
+#[cfg(test)]
+mod submission_pending_tests {
+    use crate::{DataKey, Escrow, EscrowContract, EscrowContractClient, Status, GRACE_PERIOD, SUBMISSION_GRACE_PERIOD};
+    use soroban_sdk::testutils::{Address as AddressTestUtils, Ledger};
+    use soroban_sdk::{token, Address, Env};
+
+    struct TestContext {
+        env: Env,
+        contract_id: Address,
+        token_address: Address,
+        default_arbitrator: Address,
+        client_contract: EscrowContractClient<'static>,
+        token_client: token::Client<'static>,
+        token_contract_client: token::StellarAssetClient<'static>,
+    }
+
+    impl TestContext {
+        fn new() -> Self {
+            let env = Env::default();
+            env.mock_all_auths_allowing_non_root_auth();
+            let contract_id = env.register_contract(None, EscrowContract);
+            let token_admin = Address::generate(&env);
+            let token_contract = env.register_stellar_asset_contract_v2(token_admin);
+            let token_address = token_contract.address();
+            let default_arbitrator = Address::generate(&env);
+
+            let client_contract = EscrowContractClient::new(&env, &contract_id);
+            let token_client = token::Client::new(&env, &token_address);
+            let token_contract_client = token::StellarAssetClient::new(&env, &token_address);
+
+            TestContext {
+                env,
+                contract_id,
+                token_address,
+                default_arbitrator,
+                client_contract,
+                token_client,
+                token_contract_client,
+            }
+        }
+
+        fn get_escrow(&self, engagement_id: u64) -> Escrow {
+            self.env.as_contract(&self.contract_id, || {
+                self.env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Escrow(engagement_id))
+                    .expect("Escrow should exist")
+            })
+        }
+
+        fn setup_funded_escrow(
+            &self,
+            material: i128,
+            labor: i128,
+            deadline_offset: u64,
+        ) -> (Address, Address, u64) {
+            let client = Address::generate(&self.env);
+            let artisan = Address::generate(&self.env);
+            let deadline = self.env.ledger().timestamp() + deadline_offset;
+            let id = self.client_contract.initialize(
+                &client,
+                &artisan,
+                &self.default_arbitrator,
+                &self.token_address,
+                &material,
+                &labor,
+                &deadline,
+                &soroban_sdk::vec![&self.env],
+                &0u32,
+                &soroban_sdk::vec![&self.env],
+            );
+            self.token_contract_client.mint(&client, &(material + labor));
+            self.client_contract.deposit(&id, &self.token_address);
+            (client, artisan, id)
+        }
+    }
+
+    #[test]
+    fn test_artisan_submit_work_transitions_to_submission_pending() {
+        let ctx = TestContext::new();
+        let (_client, _artisan, id) = ctx.setup_funded_escrow(1_000, 4_000, 86_400);
+
+        assert_eq!(ctx.get_escrow(id).status, Status::Funded);
+
+        ctx.client_contract.submit_work(&id);
+
+        let escrow = ctx.get_escrow(id);
+        assert_eq!(escrow.status, Status::SubmissionPending);
+
+        // Verify storage key exists
+        ctx.env.as_contract(&ctx.contract_id, || {
+            let stored_time: Option<u64> = ctx.env.storage().persistent().get(&DataKey::SubmissionPending(id));
+            assert!(stored_time.is_some());
+        });
+    }
+
+    #[test]
+    fn test_trigger_submission_pending_transitions_state() {
+        let ctx = TestContext::new();
+        let (_client, _artisan, id) = ctx.setup_funded_escrow(1_000, 4_000, 86_400);
+
+        ctx.client_contract.trigger_submission_pending(&id);
+
+        let escrow = ctx.get_escrow(id);
+        assert_eq!(escrow.status, Status::SubmissionPending);
+    }
+
+    #[test]
+    #[should_panic(expected = "Escrow must be Funded or InProgress to submit work")]
+    fn test_submit_work_fails_if_not_funded() {
+        let ctx = TestContext::new();
+        let client = Address::generate(&ctx.env);
+        let artisan = Address::generate(&ctx.env);
+        let deadline = ctx.env.ledger().timestamp() + 86_400;
+        let id = ctx.client_contract.initialize(
+            &client,
+            &artisan,
+            &ctx.default_arbitrator,
+            &ctx.token_address,
+            &1_000,
+            &4_000,
+            &deadline,
+            &soroban_sdk::vec![&ctx.env],
+            &0u32,
+            &soroban_sdk::vec![&ctx.env],
+        );
+        // Not deposited, status is Pending
+        ctx.client_contract.submit_work(&id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Submission Pending is active; reclaim is locked for an additional 12 hours")]
+    fn test_reclaim_blocked_during_submission_pending_grace_period() {
+        let ctx = TestContext::new();
+        let deadline_offset = 10;
+        let (_client, _artisan, id) = ctx.setup_funded_escrow(1_000, 4_000, deadline_offset);
+
+        let deadline = ctx.get_escrow(id).deadline;
+
+        // Artisan submits work
+        ctx.client_contract.submit_work(&id);
+        assert_eq!(ctx.get_escrow(id).status, Status::SubmissionPending);
+
+        // Fast forward past normal deadline + GRACE_PERIOD (24h)
+        // Normal reclaim would succeed at deadline + 86400 + 1
+        ctx.env.ledger().set_timestamp(deadline + GRACE_PERIOD + 1);
+
+        // Reclaim should fail because extra 12h SUBMISSION_GRACE_PERIOD is active
+        ctx.client_contract.reclaim(&id, &ctx.token_address);
+    }
+
+    #[test]
+    fn test_reclaim_succeeds_after_submission_pending_grace_period_elapses() {
+        let ctx = TestContext::new();
+        let deadline_offset = 10;
+        let (client, _artisan, id) = ctx.setup_funded_escrow(1_000, 4_000, deadline_offset);
+
+        let deadline = ctx.get_escrow(id).deadline;
+
+        // Artisan submits work
+        ctx.client_contract.submit_work(&id);
+        assert_eq!(ctx.get_escrow(id).status, Status::SubmissionPending);
+
+        let client_bal_before = ctx.token_client.balance(&client);
+
+        // Fast forward past deadline + GRACE_PERIOD (24h) + SUBMISSION_GRACE_PERIOD (12h) + 1s
+        ctx.env.ledger().set_timestamp(deadline + GRACE_PERIOD + SUBMISSION_GRACE_PERIOD + 1);
+
+        // Reclaim should now succeed
+        ctx.client_contract.reclaim(&id, &ctx.token_address);
+
+        let client_bal_after = ctx.token_client.balance(&client);
+        assert_eq!(client_bal_after, client_bal_before + 5_000);
+        assert_eq!(ctx.get_escrow(id).status, Status::Refunded);
+
+        // Storage key should be cleaned up
+        ctx.env.as_contract(&ctx.contract_id, || {
+            let stored_time: Option<u64> = ctx.env.storage().persistent().get(&DataKey::SubmissionPending(id));
+            assert!(stored_time.is_none());
+        });
+    }
+
+    #[test]
+    fn test_client_release_succeeds_from_submission_pending() {
+        let ctx = TestContext::new();
+        let (_client, artisan, id) = ctx.setup_funded_escrow(1_000, 4_000, 86_400);
+
+        ctx.client_contract.submit_work(&id);
+        assert_eq!(ctx.get_escrow(id).status, Status::SubmissionPending);
+
+        let artisan_bal_before = ctx.token_client.balance(&artisan);
+
+        // Client approves and releases from SubmissionPending state
+        ctx.client_contract.release(&id, &ctx.token_address);
+
+        let artisan_bal_after = ctx.token_client.balance(&artisan);
+        assert_eq!(artisan_bal_after, artisan_bal_before + 5_000);
+        assert_eq!(ctx.get_escrow(id).status, Status::Released);
+
+        // Storage key cleaned up
+        ctx.env.as_contract(&ctx.contract_id, || {
+            let stored_time: Option<u64> = ctx.env.storage().persistent().get(&DataKey::SubmissionPending(id));
+            assert!(stored_time.is_none());
+        });
+    }
+
+    #[test]
+    fn test_dispute_allowed_from_submission_pending() {
+        let ctx = TestContext::new();
+        let (client, _artisan, id) = ctx.setup_funded_escrow(1_000, 4_000, 86_400);
+
+        ctx.client_contract.submit_work(&id);
+        assert_eq!(ctx.get_escrow(id).status, Status::SubmissionPending);
+
+        ctx.client_contract.dispute(&id, &client);
+        assert_eq!(ctx.get_escrow(id).status, Status::Disputed);
+    }
+
+    #[test]
+    fn test_release_materials_allowed_from_submission_pending() {
+        let ctx = TestContext::new();
+        let (_client, artisan, id) = ctx.setup_funded_escrow(2_000, 3_000, 86_400);
+
+        ctx.client_contract.submit_work(&id);
+        assert_eq!(ctx.get_escrow(id).status, Status::SubmissionPending);
+
+        let artisan_bal_before = ctx.token_client.balance(&artisan);
+        ctx.client_contract.release_materials(&id, &ctx.token_address, &artisan);
+        let artisan_bal_after = ctx.token_client.balance(&artisan);
+
+        assert_eq!(artisan_bal_after, artisan_bal_before + 2_000);
+        assert_eq!(ctx.get_escrow(id).status, Status::SubmissionPending);
+        assert!(ctx.get_escrow(id).materials_released);
+    }
+}
+

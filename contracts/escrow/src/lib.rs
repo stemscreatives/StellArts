@@ -14,7 +14,8 @@ const MAX_JURY_REWARD_BPS: u32 = 10_000;
 const ESCROW_TTL: u32 = 1_036_800; // ~60 days
 const NEXT_ID_TTL: u32 = 6_220_800; // ~1 year
 const TTL_THRESHOLD: u32 = 17_280; // ~1 day - triggers extension when TTL drops below this
-const GRACE_PERIOD: u64 = 86_400; // 24 hours in seconds - artisan protection window after deadline
+pub const GRACE_PERIOD: u64 = 86_400; // 24 hours in seconds - artisan protection window after deadline
+pub const SUBMISSION_GRACE_PERIOD: u64 = 43_200; // 12 hours in seconds - additional lock when Submission Pending is active
 
 /// Multi-sig configuration for large escrow payments.
 /// When `required_signers` is non-empty, `release` requires that at least
@@ -77,6 +78,7 @@ pub enum Status {
     Refunded, // added for reclaimed/returned escrows
     Disputed,
     Resolved, // dispute resolved with split distribution
+    SubmissionPending, // artisan submitted deliverables; locks reclaim for +12h
 }
 
 #[contracttype]
@@ -110,6 +112,8 @@ pub enum DataKey {
     DisputeResolver,
     /// Portion of the protocol fee (out of 10_000) allocated to jury rewards.
     JuryRewardBps,
+    /// Timestamp when SubmissionPending state was triggered by the artisan
+    SubmissionPending(u64),
 }
 
 #[contracttype]
@@ -206,6 +210,14 @@ pub struct DisputeResolvedEvent {
     pub token: Address,
     pub client_amount: i128,
     pub artisan_amount: i128,
+    pub timestamp: u64,
+}
+
+// Event emitted when artisan transitions an escrow into Submission Pending
+#[contracttype]
+pub struct SubmissionPendingEvent {
+    pub id: u64,
+    pub artisan: Address,
     pub timestamp: u64,
 }
 
@@ -581,8 +593,8 @@ impl EscrowContract {
             panic!("Only client or artisan can release materials");
         }
 
-        // State check: must be funded or in progress
-        if escrow.status != Status::Funded && escrow.status != Status::InProgress {
+        // State check: must be funded, in progress, or submission pending
+        if escrow.status != Status::Funded && escrow.status != Status::InProgress && escrow.status != Status::SubmissionPending {
             panic!("Escrow must be Funded or InProgress to release materials");
         }
 
@@ -650,7 +662,7 @@ impl EscrowContract {
             panic!("Deadline has passed; cannot release funds");
         }
 
-        if escrow.status != Status::Funded && escrow.status != Status::InProgress {
+        if escrow.status != Status::Funded && escrow.status != Status::InProgress && escrow.status != Status::SubmissionPending {
             panic!("Escrow is not funded or in progress");
         }
 
@@ -690,6 +702,9 @@ impl EscrowContract {
 
         escrow.status = Status::Released;
         env.storage().persistent().set(&key, &escrow);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SubmissionPending(engagement_id));
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, ESCROW_TTL);
@@ -747,7 +762,7 @@ impl EscrowContract {
             panic!("All milestones have already been released");
         }
 
-        if escrow.status != Status::Funded && escrow.status != Status::InProgress {
+        if escrow.status != Status::Funded && escrow.status != Status::InProgress && escrow.status != Status::SubmissionPending {
             panic!("Escrow is not funded or in progress");
         }
 
@@ -887,8 +902,8 @@ impl EscrowContract {
             panic!("Signer is not in the multi-sig required signers list");
         }
 
-        // Escrow must be Funded or InProgress
-        if escrow.status != Status::Funded && escrow.status != Status::InProgress {
+        // Escrow must be Funded, InProgress, or SubmissionPending
+        if escrow.status != Status::Funded && escrow.status != Status::InProgress && escrow.status != Status::SubmissionPending {
             panic!("Escrow must be Funded or InProgress to approve");
         }
 
@@ -934,8 +949,11 @@ impl EscrowContract {
         // Auth: only the client may reclaim
         escrow.client.require_auth();
 
-        // State check: must be funded
-        if escrow.status != Status::Funded {
+        // State check: must be funded, in progress, or submission pending
+        if escrow.status != Status::Funded
+            && escrow.status != Status::InProgress
+            && escrow.status != Status::SubmissionPending
+        {
             panic!("Escrow must be Funded to reclaim");
         }
 
@@ -945,9 +963,29 @@ impl EscrowContract {
             panic!("Deadline has not passed; cannot reclaim yet");
         }
 
-        // Check if we're still within the grace period
-        let grace_deadline = escrow.deadline + GRACE_PERIOD;
-        if current_time <= grace_deadline {
+        // Base grace period check
+        let base_grace_deadline = escrow.deadline + GRACE_PERIOD;
+        if escrow.status == Status::SubmissionPending {
+            let sub_key = DataKey::SubmissionPending(engagement_id);
+            let submitted_at: u64 = env
+                .storage()
+                .persistent()
+                .get(&sub_key)
+                .unwrap_or(current_time);
+
+            // Additional 12 hours lock: client cannot reclaim during the extended window
+            let submission_locked_until = core::cmp::max(
+                base_grace_deadline + SUBMISSION_GRACE_PERIOD,
+                submitted_at + SUBMISSION_GRACE_PERIOD,
+            );
+
+            if current_time <= submission_locked_until {
+                panic!("Submission Pending is active; reclaim is locked for an additional 12 hours");
+            }
+
+            // Cleanup submission pending storage key
+            env.storage().persistent().remove(&sub_key);
+        } else if current_time <= base_grace_deadline {
             // Within grace period: only allow if both parties approved early reclaim
             let early_reclaim_key = DataKey::EarlyReclaim(engagement_id);
             let has_early_approval: bool = env
@@ -1028,8 +1066,11 @@ impl EscrowContract {
             panic!("Only client or artisan can approve early reclaim");
         }
 
-        // State check: must be funded
-        if escrow.status != Status::Funded {
+        // State check: must be funded, in progress, or submission pending
+        if escrow.status != Status::Funded
+            && escrow.status != Status::InProgress
+            && escrow.status != Status::SubmissionPending
+        {
             panic!("Escrow must be Funded to approve early reclaim");
         }
 
@@ -1076,7 +1117,10 @@ impl EscrowContract {
             panic!("Only client or artisan can approve deadline extension");
         }
 
-        if escrow.status != Status::Funded && escrow.status != Status::InProgress {
+        if escrow.status != Status::Funded
+            && escrow.status != Status::InProgress
+            && escrow.status != Status::SubmissionPending
+        {
             panic!("Escrow must be Funded or InProgress to extend deadline");
         }
 
@@ -1415,6 +1459,60 @@ impl EscrowContract {
             .extend_ttl(&key, TTL_THRESHOLD, ESCROW_TTL);
     }
 
+    /// Transitions escrow status to `SubmissionPending` when artisan submits deliverables.
+    /// This locks the client's ability to call `reclaim` for an additional 12 hours
+    /// beyond the normal grace period to prevent TOCTOU race condition sniping.
+    pub fn submit_work(env: Env, engagement_id: u64) {
+        assert!(!Self::is_paused(&env), "contract is paused");
+        let key = DataKey::Escrow(engagement_id);
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Escrow not found");
+
+        // Auth: strictly the artisan triggers submission pending
+        escrow.artisan.require_auth();
+
+        // Must be in Funded, InProgress, or already SubmissionPending
+        if escrow.status != Status::Funded
+            && escrow.status != Status::InProgress
+            && escrow.status != Status::SubmissionPending
+        {
+            panic!("Escrow must be Funded or InProgress to submit work");
+        }
+
+        let current_time = env.ledger().timestamp();
+
+        // Record submission timestamp
+        let sub_key = DataKey::SubmissionPending(engagement_id);
+        env.storage().persistent().set(&sub_key, &current_time);
+        env.storage()
+            .persistent()
+            .extend_ttl(&sub_key, TTL_THRESHOLD, ESCROW_TTL);
+
+        escrow.status = Status::SubmissionPending;
+        env.storage().persistent().set(&key, &escrow);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, ESCROW_TTL);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "submit_work"), engagement_id),
+            SubmissionPendingEvent {
+                id: engagement_id,
+                artisan: escrow.artisan.clone(),
+                timestamp: current_time,
+            },
+        );
+    }
+
+    /// Alias for submit_work matching the exact issue acceptance criteria phrasing
+    pub fn trigger_submission_pending(env: Env, engagement_id: u64) {
+        Self::submit_work(env, engagement_id);
+    }
+
     /// Initiate a dispute on a funded escrow
     /// Can be called by either the client or artisan
     /// Transitions the escrow from Funded to Disputed status
@@ -1435,8 +1533,11 @@ impl EscrowContract {
             panic!("Only client or artisan can initiate a dispute");
         }
 
-        // State check: escrow must be Funded or InProgress to dispute
-        if escrow.status != Status::Funded && escrow.status != Status::InProgress {
+        // State check: escrow must be Funded, InProgress, or SubmissionPending to dispute
+        if escrow.status != Status::Funded
+            && escrow.status != Status::InProgress
+            && escrow.status != Status::SubmissionPending
+        {
             panic!("Escrow must be Funded or InProgress to initiate a dispute");
         }
 
